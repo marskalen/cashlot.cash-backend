@@ -1,11 +1,11 @@
-// index.js — Cashlot backend (Express + SQLite)
-// ESM because package.json has "type": "module"
+// index.js — Cashlot backend (Express + SQLite, ESM)
 
 import express from "express";
 import cors from "cors";
 import sqlite3 from "sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
+import bcrypt from "bcryptjs";
 
 // ---------- Setup ----------
 const __filename = fileURLToPath(import.meta.url);
@@ -15,87 +15,105 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Use SQLite file next to this file
+// SQLite DB file next to this file
 const dbPath = path.join(__dirname, "cashlot.db");
-const db = new sqlite3.Database(dbPath);
+const raw = new sqlite3.Database(dbPath);
+
+// Promisified helpers
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    raw.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve(this); // has lastID, changes
+    });
+  });
+}
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    raw.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    raw.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
 
 // ---------- DB bootstrap ----------
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users
-    ( id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT UNIQUE,
-      password TEXT,
-      role TEXT DEFAULT "user",
-      coins INTEGER DEFAULT 0
-    )
-  `);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS offers
-    ( id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT, type TEXT, payout TEXT )
-  `);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS leaderboard
-    ( id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user TEXT, earned INTEGER )
-  `);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS payouts
-    ( id INTEGER PRIMARY KEY AUTOINCREMENT,
-      method TEXT, amount INTEGER, status TEXT )
-  `);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS referrals
-    ( id INTEGER PRIMARY KEY AUTOINCREMENT,
-      referrer TEXT, referee TEXT, bonus INTEGER )
-  `);
+await dbRun(`
+  CREATE TABLE IF NOT EXISTS users
+  ( id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE,
+    password TEXT,              -- stores bcrypt hash
+    role TEXT DEFAULT "user",
+    coins INTEGER DEFAULT 0
+  )
+`);
+await dbRun(`
+  CREATE TABLE IF NOT EXISTS offers
+  ( id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, type TEXT, payout TEXT )
+`);
+await dbRun(`
+  CREATE TABLE IF NOT EXISTS leaderboard
+  ( id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user TEXT, earned INTEGER )
+`);
+await dbRun(`
+  CREATE TABLE IF NOT EXISTS payouts
+  ( id INTEGER PRIMARY KEY AUTOINCREMENT,
+    method TEXT, amount INTEGER, status TEXT )
+`);
+await dbRun(`
+  CREATE TABLE IF NOT EXISTS referrals
+  ( id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referrer TEXT, referee TEXT, bonus INTEGER )
+`);
 
-  // seed admin
-  db.get("SELECT * FROM users WHERE email=?", ["admin@cashlot.gg"], (err, row) => {
-    if (!row) {
-      db.run(
-        "INSERT INTO users (email, password, role, coins) VALUES (?,?,?,?)",
-        ["admin@cashlot.gg", "admin123", "admin", 100000]
-      );
-    }
-  });
+// seed admin (only if missing)
+{
+  const row = await dbGet("SELECT * FROM users WHERE email=?", ["admin@cashlot.gg"]);
+  if (!row) {
+    const hash = await bcrypt.hash("admin123", 10);
+    await dbRun(
+      "INSERT INTO users (email, password, role, coins) VALUES (?,?,?,?)",
+      ["admin@cashlot.gg", hash, "admin", 100000]
+    );
+  }
+}
 
-  // seed offers
-  db.get("SELECT COUNT(*) AS c FROM offers", (err, row) => {
-    if (row && row.c === 0) {
-      const offers = [
-        ["BitLabs Surveys", "Surveys", "op til 2,500 coins"],
-        ["AdGate Media", "Offerwall", "op til 10,000 coins"],
-        ["CPX Research", "Surveys", "op til 3,000 coins"],
-        ["Lootably", "Offerwall", "op til 8,000 coins"],
-        ["RevU Apps", "Apps", "op til 15,000 coins"],
-      ];
-      offers.forEach((o) =>
-        db.run("INSERT INTO offers (name,type,payout) VALUES (?,?,?)", o)
-      );
+// seed demo data
+{
+  const row = await dbGet("SELECT COUNT(*) AS c FROM offers");
+  if (row?.c === 0) {
+    const offers = [
+      ["BitLabs Surveys", "Surveys", "op til 2,500 coins"],
+      ["AdGate Media", "Offerwall", "op til 10,000 coins"],
+      ["CPX Research", "Surveys", "op til 3,000 coins"],
+      ["Lootably", "Offerwall", "op til 8,000 coins"],
+      ["RevU Apps", "Apps", "op til 15,000 coins"],
+    ];
+    for (const o of offers) {
+      await dbRun("INSERT INTO offers (name,type,payout) VALUES (?,?,?)", o);
     }
-  });
-
-  // seed leaderboard
-  db.get("SELECT COUNT(*) AS c FROM leaderboard", (err, row) => {
-    if (row && row.c === 0) {
-      const lb = [
-        ["@mads", 48250],
-        ["@sara", 41190],
-        ["@niko", 36210],
-        ["@clara", 28560],
-        ["@leo", 21050],
-      ];
-      lb.forEach((l) =>
-        db.run("INSERT INTO leaderboard (user, earned) VALUES (?,?)", l)
-      );
+  }
+  const row2 = await dbGet("SELECT COUNT(*) AS c FROM leaderboard");
+  if (row2?.c === 0) {
+    const lb = [
+      ["@mads", 48250],
+      ["@sara", 41190],
+      ["@niko", 36210],
+      ["@clara", 28560],
+      ["@leo", 21050],
+    ];
+    for (const l of lb) {
+      await dbRun("INSERT INTO leaderboard (user, earned) VALUES (?,?)", l);
     }
-  });
-});
+  }
+}
 
 // ---------- CONFIG & auth helpers ----------
-const SIGNUP_BONUS_COINS = Number(process.env.SIGNUP_BONUS_COINS || 500); // ~ $0.50 if 1000 coins = $1
+const SIGNUP_BONUS_COINS = Number(process.env.SIGNUP_BONUS_COINS || 500);
 
 // very simple tokens: "u-<id>"
 function makeToken(userId) {
@@ -115,116 +133,128 @@ function auth(req, res, next) {
   next();
 }
 
-// ---------- Public API (demo data) ----------
-app.get("/api/offers", (req, res) => {
-  db.all("SELECT * FROM offers", (err, rows) => res.json(rows || []));
+// --- tiny user repo ---
+const db = {
+  user: {
+    findByEmail: (email) =>
+      dbGet("SELECT * FROM users WHERE email = ?", [email]),
+    findById: (id) =>
+      dbGet("SELECT id,email,role,coins FROM users WHERE id = ?", [id]),
+    create: async ({ email, password_hash, role = "user", balance = 0, referral_code_used = null }) => {
+      const r = await dbRun(
+        "INSERT INTO users (email, password, role, coins) VALUES (?,?,?,?)",
+        [email, password_hash, role, balance]
+      );
+      return { id: r.lastID, email, role, coins: balance };
+    },
+    incrementCoins: (id, delta) =>
+      dbRun("UPDATE users SET coins = coins + ? WHERE id = ?", [delta, id]),
+  },
+};
+
+// ---------- Public API (demo) ----------
+app.get("/api/offers", async (_req, res) => {
+  const rows = await dbAll("SELECT * FROM offers");
+  res.json(rows || []);
+});
+app.get("/api/leaderboard", async (_req, res) => {
+  const rows = await dbAll("SELECT user, earned FROM leaderboard ORDER BY earned DESC");
+  res.json(rows || []);
+});
+app.get("/api/payouts", async (_req, res) => {
+  const rows = await dbAll("SELECT * FROM payouts ORDER BY id DESC");
+  res.json(rows || []);
+});
+app.get("/api/referrals", async (_req, res) => {
+  const rows = await dbAll("SELECT * FROM referrals ORDER BY id DESC");
+  res.json(rows || []);
 });
 
-app.get("/api/leaderboard", (req, res) => {
-  db.all(
-    "SELECT user, earned FROM leaderboard ORDER BY earned DESC",
-    (err, rows) => res.json(rows || [])
-  );
-});
+// ---------- Auth + user (supports both /auth/* and /api/auth/*) ----------
+const signupHandler = async (req, res) => {
+  try {
+    const { email, password, referralCode } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "Missing email or password" });
+    if (String(password).length < 6) return res.status(400).json({ error: "Password must be ≥ 6 chars" });
 
-app.get("/api/payouts", (req, res) => {
-  db.all("SELECT * FROM payouts", (err, rows) => res.json(rows || []));
-});
+    const existing = await db.user.findByEmail(email);
+    if (existing) return res.status(409).json({ error: "Email already in use" });
 
-app.get("/api/referrals", (req, res) => {
-  db.all("SELECT * FROM referrals", (err, rows) => res.json(rows || []));
-});
+    const hash = await bcrypt.hash(password, 10);
+    const user = await db.user.create({
+      email,
+      password_hash: hash,
+      balance: SIGNUP_BONUS_COINS,
+      referral_code_used: referralCode || null,
+    });
 
-// ---------- Auth + user ----------
-app.post("/api/auth/signup", (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password)
-    return res.status(400).json({ error: "missing fields" });
+    const token = makeToken(user.id);
+    res.json({ token });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Signup failed" });
+  }
+};
+const loginHandler = async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "Missing email or password" });
 
-  db.get("SELECT id FROM users WHERE email = ?", [email], (err, row) => {
-    if (row) return res.status(400).json({ error: "user exists" });
+    const user = await db.user.findByEmail(email);
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    db.run(
-      "INSERT INTO users (email, password, role, coins) VALUES (?,?,?,?)",
-      [email, password, "user", SIGNUP_BONUS_COINS],
-      function (err2) {
-        if (err2) return res.status(500).json({ error: "db error" });
-        const id = this.lastID;
-        const token = makeToken(id);
-        res.json({
-          token,
-          user: { id, email, role: "user", coins: SIGNUP_BONUS_COINS },
-        });
-      }
-    );
-  });
-});
+    const ok = await bcrypt.compare(password, user.password || "");
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-app.post("/api/auth/login", (req, res) => {
-  const { email, password } = req.body || {};
-  db.get(
-    "SELECT id,email,role,coins FROM users WHERE email=? AND password=?",
-    [email, password],
-    (err, row) => {
-      if (!row) return res.status(401).json({ error: "invalid credentials" });
-      const token = makeToken(row.id);
-      res.json({ token, user: row });
-    }
-  );
-});
+    const token = makeToken(user.id);
+    res.json({ token });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Login failed" });
+  }
+};
+const meHandler = async (req, res) => {
+  const user = await db.user.findById(req.userId);
+  if (!user) return res.status(404).json({ error: "Not found" });
+  res.json(user);
+};
 
-app.get("/api/me", auth, (req, res) => {
-  db.get(
-    "SELECT id,email,role,coins FROM users WHERE id=?",
-    [req.userId],
-    (err, row) => {
-      if (!row) return res.status(404).json({ error: "not found" });
-      res.json(row);
-    }
-  );
-});
+app.post(["/auth/signup", "/api/auth/signup"], signupHandler);
+app.post(["/auth/login", "/api/auth/login"], loginHandler);
+app.get(["/me", "/api/me"], auth, meHandler);
 
 // ---------- Payout requests ----------
-app.post("/api/payouts/request", auth, (req, res) => {
+app.post("/api/payouts/request", auth, async (req, res) => {
   const { method, amount } = req.body || {};
   const amt = Number(amount) || 0;
-  if (!method || amt <= 0)
-    return res.status(400).json({ error: "invalid" });
-
-  db.run(
+  if (!method || amt <= 0) return res.status(400).json({ error: "invalid" });
+  const r = await dbRun(
     "INSERT INTO payouts (method, amount, status) VALUES (?,?,?)",
-    [method, amt, "pending"],
-    function (err) {
-      if (err) return res.status(500).json({ error: "db error" });
-      res.json({ ok: true, id: this.lastID });
-    }
+    [method, amt, "pending"]
   );
+  res.json({ ok: true, id: r.lastID });
 });
-
-// (Optional) list payout requests (here not filtered by user, adjust if needed)
-app.get("/api/payouts/mine", auth, (req, res) => {
-  db.all(
-    "SELECT id,method,amount,status FROM payouts ORDER BY id DESC",
-    (err, rows) => res.json(rows || [])
+app.get("/api/payouts/mine", auth, async (_req, res) => {
+  const rows = await dbAll(
+    "SELECT id,method,amount,status FROM payouts ORDER BY id DESC"
   );
+  res.json(rows || []);
 });
 
 // ---------- BitLabs postback (TEMP: no signature verify) ----------
-app.get("/postback/bitlabs", (req, res) => {
-  const { user_id, amount = 0, tx_id } = req.query;
-
-  // For now just log as "paid" in payouts.
-  db.run(
+app.get("/postback/bitlabs", async (req, res) => {
+  const { user_id, amount = 0 } = req.query;
+  await dbRun(
     "INSERT INTO payouts (method, amount, status) VALUES (?,?,?)",
     ["bitlabs", Number(amount) || 0, "paid"]
   );
-
-  // If you map BitLabs user_id to your user ids:
-  // db.run('UPDATE users SET coins = coins + ? WHERE id = ?',
-  //   [Number(amount)||0, Number(user_id)||0]);
-
+  // Optional credit:
+  // if (user_id) await db.user.incrementCoins(Number(user_id), Number(amount)||0);
   res.status(200).send("OK");
 });
+
+// ---------- Healthcheck ----------
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 // ---------- Start server ----------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
