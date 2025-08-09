@@ -96,5 +96,6 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
   db.all('SELECT id,email,role,coins FROM users', (err, rows)=> res.json(rows || []))
 })
 
-const PORT = 4000
-app.listen(PORT, ()=> console.log('Cashlot backend on http://localhost:'+PORT))
+const PORT = process.env.PORT || 4000
+app.listen(PORT, () => console.log('Cashlot backend on port ' + PORT))
+
