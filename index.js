@@ -1,9 +1,9 @@
-
 import express from 'express'
 import cors from 'cors'
 import sqlite3 from 'sqlite3'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import crypto from 'crypto' // <-- ny
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -53,7 +53,10 @@ db.serialize(() => {
   })
 })
 
-// Auth (demo)
+// ---------- Healthcheck (god til Render) ----------
+app.get('/healthz', (_req, res) => res.send('ok'))
+
+// ---------- Auth (demo) ----------
 app.post('/api/auth/signup', (req,res)=>{
   const { email, password } = req.body
   if(!email || !password) return res.status(400).json({error:'missing fields'})
@@ -72,30 +75,59 @@ app.post('/api/auth/login', (req,res)=>{
   })
 })
 
-// Public endpoints
-app.get('/api/offers', (req,res)=>{
+// ---------- Public endpoints ----------
+app.get('/api/offers', (_req,res)=>{
   db.all('SELECT * FROM offers', (err, rows)=> res.json(rows || []))
 })
-app.get('/api/leaderboard', (req,res)=>{
+app.get('/api/leaderboard', (_req,res)=>{
   db.all('SELECT user, earned FROM leaderboard ORDER BY earned DESC', (err, rows)=> res.json(rows || []))
 })
-app.get('/api/payouts', (req,res)=>{
+app.get('/api/payouts', (_req,res)=>{
   db.all('SELECT * FROM payouts', (err, rows)=> res.json(rows || []))
 })
-app.get('/api/referrals', (req,res)=>{
+app.get('/api/referrals', (_req,res)=>{
   db.all('SELECT * FROM referrals', (err, rows)=> res.json(rows || []))
 })
 
-// Admin (very simple guard)
+// ---------- Admin (very simple guard) ----------
 function requireAdmin(req,res,next){
   const token = req.headers['x-token']
   if(token === 'admin-token') return next()
   res.status(403).json({error:'admin only'})
 }
-app.get('/api/admin/users', requireAdmin, (req,res)=>{
+app.get('/api/admin/users', requireAdmin, (_req,res)=>{
   db.all('SELECT id,email,role,coins FROM users', (err, rows)=> res.json(rows || []))
 })
 
+// ---------- BitLabs S2S Postback (test-version) ----------
+app.get('/postback/bitlabs', (req, res) => {
+  // BitLabs konfigurér postback til at kalde denne URL og sende disse parametre
+  const { user_id, amount, tx_id, signature } = req.query
+
+  // TODO: Verificér signaturen iflg. BitLabs’ dokumentation.
+  // Nedenstående er KUN et eksempel – BitLabs kan kræve en anden streng
+  // og bruge SECRET eller SERVER KEY.
+  //
+  // const expected = crypto
+  //   .createHmac('sha256', process.env.BITLABS_SERVER_KEY) // eller SECRET
+  //   .update(`${user_id}:${amount}:${tx_id}`)
+  //   .digest('hex')
+  // if (signature !== expected) {
+  //   return res.status(403).send('bad signature')
+  // }
+
+  // Registrér payout (demo). Her kan du i stedet kreditere coins til user_id.
+  db.run(
+    'INSERT INTO payouts (method, amount, status) VALUES (?,?,?)',
+    ['bitlabs', Number(amount) || 0, 'paid']
+  )
+
+  // Eksempel på kredit af coins til en bruger (hvis du har et felt external_id):
+  // db.run('UPDATE users SET coins = coins + ? WHERE external_id = ?', [Number(amount)||0, user_id])
+
+  res.status(200).send('OK')
+})
+
+// ---------- Start server ----------
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log('Cashlot backend on port ' + PORT))
-
