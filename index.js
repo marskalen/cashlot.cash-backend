@@ -9,26 +9,50 @@ import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
 import createAuthRouter from "./routes/auth.js";
 
+/* ---------- ENV ---------- */
 const {
   PORT = 10000,
+  NODE_ENV = "production",
+
+  // CORS: tillad flere origins (kommasepareret)
+  FRONTEND_ORIGINS = "https://cashlot.cash,https://www.cashlot.cash,http://localhost:5173",
+
+  // JWT
   JWT_SECRET = "dev_secret_change_me",
-  FRONTEND_ORIGIN = "https://cashlot.cash",
+
+  // SMTP (kræves i prod for at maile rigtige koder)
   SMTP_HOST,
-  SMTP_PORT,
+  SMTP_PORT = "587",
   SMTP_USER,
   SMTP_PASS,
   SMTP_FROM = "no-reply@cashlot.cash",
+
+  // Google Sign-In (valgfri)
   GOOGLE_CLIENT_ID,
+
+  // Offerwalls
   BITLABS_S2S_KEY,
 } = process.env;
 
+/* ---------- App ---------- */
 const app = express();
 
-/* ---------- CORS ---------- */
+/* ---------- CORS (robust) ---------- */
+const ORIGIN_LIST = FRONTEND_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+function originOk(origin) {
+  if (!origin) return true; // curl/mobile apps
+  return ORIGIN_LIST.some(allow => {
+    if (allow.startsWith("regex:")) {
+      const re = new RegExp(allow.slice(6));
+      return re.test(origin);
+    }
+    return allow === origin;
+  });
+}
 app.use(cors({
-  origin: FRONTEND_ORIGIN,
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
+  origin: (origin, cb) => originOk(origin) ? cb(null, true) : cb(new Error("CORS: origin not allowed")),
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 }));
 app.options("*", cors());
@@ -38,7 +62,11 @@ app.use(express.json());
 
 /* ---------- Health ---------- */
 app.get("/health", (_req, res) =>
-  res.json({ ok: true, env: process.env.NODE_ENV || "production" })
+  res.json({
+    ok: true,
+    env: NODE_ENV,
+    corsOrigins: ORIGIN_LIST,
+  })
 );
 
 /* ---------- Mailer ---------- */
@@ -51,14 +79,32 @@ function makeTransport() {
       auth: { user: SMTP_USER, pass: SMTP_PASS },
     });
   }
+  // Dev fallback: logger mails i konsollen (sender IKKE rigtigt)
   return {
     sendMail: async (opts) => {
-      console.log("---- DEV EMAIL ----", opts);
+      console.log("---- DEV EMAIL (NOT SENT) ----", opts);
       return { messageId: "dev" };
     },
   };
 }
 const mailer = makeTransport();
+
+/* (valgfri) debug endpoint til at teste SMTP */
+app.post("/debug/send-email", async (req, res) => {
+  try {
+    const to = String(req.body?.to || "businessmarskalen@gmail.com");
+    const info = await mailer.sendMail({
+      from: SMTP_FROM,
+      to,
+      subject: "Cashlot test",
+      text: "Hvis du ser denne mail, virker SMTP! 🎉",
+    });
+    res.json({ ok: true, messageId: info.messageId || "n/a" });
+  } catch (e) {
+    console.error("debug email err", e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
 
 /* ---------- DB ---------- */
 let db;
@@ -130,13 +176,13 @@ async function findUserByUid(uid) {
   return await db.get("SELECT * FROM users WHERE email=?", String(uid).toLowerCase());
 }
 
-/* ---------- AUTH routes (mount) ---------- */
+/* ---------- AUTH (vigtig: kræver den FULDE routes/auth.js) ---------- */
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 app.use("/auth", createAuthRouter({
   db, mailer, smtpFrom: SMTP_FROM, signToken, googleClient
 }));
 
-/* (valgfrit) Debug: list routes */
+/* (valgfri) Debug: list mounted routes */
 app.get("/__routes", (req, res) => {
   const stack = (app._router?.stack || []).map(l => {
     if (l.route) return { path: l.route.path, methods: l.route.methods };
@@ -146,7 +192,7 @@ app.get("/__routes", (req, res) => {
   res.json({ routes: stack });
 });
 
-/* ---------- BitLabs callback ---------- */
+/* ---------- BitLabs S2S callback ---------- */
 app.get("/bitlabs/callback", async (req, res) => {
   try {
     const { uid, tx, amount, key } = req.query;
@@ -169,7 +215,6 @@ app.get("/bitlabs/callback", async (req, res) => {
       "INSERT INTO offer_events (provider, txid, uid, amount, coins, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
       "bitlabs", String(tx), String(uid), isNaN(usd) ? null : usd, coins, raw
     );
-
     return res.send("OK");
   } catch (e) {
     console.error("BitLabs callback error:", e);
@@ -177,7 +222,7 @@ app.get("/bitlabs/callback", async (req, res) => {
   }
 });
 
-/* ---------- Me (protected) ---------- */
+/* ---------- Me (beskyttet) ---------- */
 app.get("/me", authMiddleware, async (req, res) => {
   const u = await db.get(
     "SELECT id,email,username,verified,coins,provider FROM users WHERE id=?",
@@ -186,10 +231,11 @@ app.get("/me", authMiddleware, async (req, res) => {
   return res.json({ user: u });
 });
 
-/* ---------- 404 fallback ---------- */
+/* ---------- 404 fallback (JSON) ---------- */
 app.use((req, res) => res.status(404).json({ error: "Not found", path: req.path }));
 
 /* ---------- Start ---------- */
 app.listen(PORT, () => {
   console.log(`Cashlot backend on :${PORT}`);
+  console.log("[CORS] Allowed origins:", ORIGIN_LIST);
 });
