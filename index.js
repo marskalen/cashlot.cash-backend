@@ -4,11 +4,12 @@ import express from "express";
 import cors from "cors";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
-import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
-import createAuthRouter from "./routes/auth.js";
+
+// ⬇️ VIGTIG: test-router (default export fra ./routes/auth.js)
+import authRouter from "./routes/auth.js";
 
 const {
   PORT = 10000,
@@ -149,20 +150,24 @@ async function findUserByUid(uid) {
   return await db.get("SELECT * FROM users WHERE email=?", String(uid).toLowerCase());
 }
 
-/* ---------- AUTH ROUTES (MOUNT) ---------- */
-const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
-app.use(
-  "/auth",
-  createAuthRouter({
-    db,
-    mailer,
-    smtpFrom: SMTP_FROM,
-    signToken,
-    googleClient,
-  })
-);
+/* ---------- AUTH ROUTES (TEST) ---------- */
+/*  ⬇️ Mount test-routeren. Når den svarer 200 OK, kan du bytte routes/auth.js
+    til den fulde version – men behold denne mount. */
+app.use("/auth", authRouter);
+
+/* ---------- Debug: se registrerede ruter ---------- */
+app.get("/__routes", (req, res) => {
+  const stack = (app._router?.stack || []).map((l) => {
+    if (l.route) return { path: l.route.path, methods: l.route.methods };
+    if (l.name === "router" && l.regexp) return { router: true, mountedAt: l.regexp.toString() };
+    return null;
+  }).filter(Boolean);
+  res.json({ routes: stack });
+});
 
 /* ---------- BitLabs callback ---------- */
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+
 app.get("/bitlabs/callback", async (req, res) => {
   try {
     const { uid, tx, amount, key } = req.query;
