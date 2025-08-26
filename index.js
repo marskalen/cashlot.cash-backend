@@ -1,3 +1,4 @@
+// index.js
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -17,24 +18,36 @@ const {
   SMTP_USER,
   SMTP_PASS,
   SMTP_FROM = "no-reply@cashlot.cash",
-  GOOGLE_CLIENT_ID
+  GOOGLE_CLIENT_ID,
+  BITLABS_S2S_KEY,
 } = process.env;
 
 const app = express();
 
-// ---- CORS & body parser ----
+/* ---------------- CORS (robust til prod) ---------------- */
+const ALLOW_ORIGIN = FRONTEND_ORIGIN || "http://localhost:5173";
+
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,                  // prod origin
+    origin: ALLOW_ORIGIN, // én streng (ikke array)
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,                       // sæt true hvis du bruger cookies/session
+    credentials: true, // OK selv hvis du ikke bruger cookies
   })
 );
+
+// Svar på preflight for alle ruter
 app.options("*", cors());
+
+// JSON body parsing
 app.use(express.json());
 
-// ---------------- DB ----------------
+/* ---------------- Hjælpe-endpoints ---------------- */
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, env: process.env.NODE_ENV || "production" });
+});
+
+/* ---------------- DB ---------------- */
 let db;
 async function initDb() {
   db = await open({
@@ -91,45 +104,48 @@ async function initDb() {
 }
 await initDb();
 
-// --------------- Email ---------------
-// Nodemailer transporter + sendMail helper (bruges i routes)
-let transporter;
-function getTransporter() {
-  if (!transporter) {
-    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
-      console.warn("SMTP not configured – emails will be logged to console.");
-      transporter = null;
-    } else {
-      transporter = nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: Number(SMTP_PORT || 587),
-        secure: Number(SMTP_PORT || 587) === 465,
-        auth: { user: SMTP_USER, pass: SMTP_PASS },
-      });
-    }
+/* ---------------- Email (SMTP via Nodemailer) ---------------- */
+function makeTransport() {
+  if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+    return nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: Number(SMTP_PORT || 587),
+      secure: Number(SMTP_PORT || 587) === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS }, // Mailtrap Email Delivery: user="api", pass="<API_TOKEN>"
+    });
   }
-  return transporter;
+  // Dev fallback → logger emails i console
+  return {
+    sendMail: async (opts) => {
+      console.log("---- DEV EMAIL (no SMTP configured) ----");
+      console.log("TO:", opts.to);
+      console.log("SUBJECT:", opts.subject);
+      console.log("TEXT:", opts.text);
+      console.log("----------------------------------------");
+      return { messageId: "dev" };
+    },
+  };
 }
-async function sendMail(to, subject, text, html) {
-  const tx = getTransporter();
-  if (!tx) {
-    console.log("---- DEV EMAIL (no SMTP configured) ----");
-    console.log("TO:", to);
-    console.log("SUBJECT:", subject);
-    console.log("TEXT:", text);
-    console.log("----------------------------------------");
-    return { dev: true };
-  }
-  return tx.sendMail({
-    from: SMTP_FROM,
-    to,
-    subject,
-    text,
-    html: html || `<pre>${text}</pre>`,
-  });
-}
+const mailer = makeTransport();
 
-// -------------- Helpers --------------
+// Midlertidigt test-endpoint (kan slettes når SMTP virker)
+app.post("/debug/send-email", async (req, res) => {
+  try {
+    const { to = "businessmarskalen@gmail.com" } = req.body || {};
+    await mailer.sendMail({
+      from: SMTP_FROM,
+      to,
+      subject: "Cashlot test",
+      text: "If you see this, SMTP works! 🎉",
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("debug email err", e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* ---------------- Helpers ---------------- */
 function genCode(n = 6) {
   return Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join("");
 }
@@ -148,6 +164,7 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+
 async function findUserByUid(uid) {
   if (/^\d+$/.test(String(uid))) {
     const u = await db.get("SELECT * FROM users WHERE id = ?", Number(uid));
@@ -157,24 +174,8 @@ async function findUserByUid(uid) {
   return u || null;
 }
 
-// --------------- Health & debug ---------------
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, env: process.env.NODE_ENV || "prod" });
-});
+/* ---------------- Routes: Auth ---------------- */
 
-// Midlertidigt SMTP test-endpoint (slet når det virker)
-app.post("/debug/send-email", async (req, res) => {
-  try {
-    const { to = "businessmarskalen@gmail.com" } = req.body || {};
-    await sendMail(to, "Cashlot test", "If you see this, SMTP works! 🎉");
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("debug email err", e);
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-// --------------- Auth routes ---------------
 // Register
 app.post("/auth/register", async (req, res) => {
   const { email, password, username } = req.body || {};
@@ -192,21 +193,21 @@ app.post("/auth/register", async (req, res) => {
   );
   const userId = result.lastID;
 
-  // send email code
-  const verifyCode = genCode(6);
+  // send email verify code
+  const code = genCode(6);
   const expiresAt = Date.now() + 1000 * 60 * 15; // 15 min
   await db.run(
     "INSERT INTO email_verification_codes (user_id, code, expires_at) VALUES (?, ?, ?)",
     userId,
-    verifyCode,
+    code,
     expiresAt
   );
-
-  await sendMail(
-    email,
-    "Verify your Cashlot email",
-    `Your verification code is: ${verifyCode} (valid for 15 minutes).`
-  );
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: "Verify your Cashlot email",
+    text: `Your verification code is: ${code} (valid for 15 minutes).`,
+  });
 
   const user = await db.get(
     "SELECT id,email,username,verified,coins,provider FROM users WHERE id = ?",
@@ -317,22 +318,20 @@ app.post("/auth/request-password-reset", async (req, res) => {
     email.toLowerCase()
   );
   if (!user) return res.json({ ok: true }); // silent (ikke leak)
-
-  const resetCode = genCode(6);
+  const code = genCode(6);
   const expiresAt = Date.now() + 1000 * 60 * 15;
   await db.run(
     "INSERT INTO password_reset_codes (user_id, code, expires_at) VALUES (?, ?, ?)",
     user.id,
-    resetCode,
+    code,
     expiresAt
   );
-
-  await sendMail(
-    email,
-    "Cashlot password reset",
-    `Your password reset code is: ${resetCode} (valid for 15 minutes).`
-  );
-
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: "Cashlot password reset",
+    text: `Your password reset code is: ${code} (valid for 15 minutes).`,
+  });
   return res.json({ ok: true });
 });
 
@@ -363,13 +362,13 @@ app.post("/auth/reset-password", async (req, res) => {
   return res.json({ ok: true });
 });
 
-// ------------- BitLabs S2S callback -------------
+/* ---------------- BitLabs S2S callback ---------------- */
 app.get("/bitlabs/callback", async (req, res) => {
   try {
     const { uid, tx, amount, key } = req.query;
 
-    if (!process.env.BITLABS_S2S_KEY) return res.status(500).send("S2S not configured");
-    if (!key || key !== process.env.BITLABS_S2S_KEY) return res.status(401).send("Unauthorized");
+    if (!BITLABS_S2S_KEY) return res.status(500).send("S2S not configured");
+    if (!key || key !== BITLABS_S2S_KEY) return res.status(401).send("Unauthorized");
     if (!uid || !tx) return res.status(400).send("Missing uid or tx");
 
     // Idempotens
@@ -404,7 +403,7 @@ app.get("/bitlabs/callback", async (req, res) => {
   }
 });
 
-// ------------- Protected example -------------
+/* ---------------- Protected example ---------------- */
 app.get("/me", authMiddleware, async (req, res) => {
   const u = await db.get(
     "SELECT id,email,username,verified,coins,provider FROM users WHERE id=?",
@@ -413,6 +412,7 @@ app.get("/me", authMiddleware, async (req, res) => {
   return res.json({ user: u });
 });
 
+/* ---------------- Start server ---------------- */
 app.listen(PORT, () => {
   console.log(`Cashlot backend on :${PORT}`);
 });
