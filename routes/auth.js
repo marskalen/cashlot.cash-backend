@@ -2,20 +2,16 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 
-/* Helpers */
 const norm = (v) => String(v ?? "").trim();
 const normEmail = (e) => norm(e).toLowerCase();
-const genCode = (n = 6) =>
-  Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join("");
-
-// Small guard: ensure integers in ms
+const genCode = (n = 6) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join("");
 const nowMs = () => Date.now();
 const inMinutes = (m) => nowMs() + m * 60 * 1000;
 
 export default function createAuthRouter({ db, mailer, smtpFrom, signToken, googleClient }) {
   const router = Router();
 
-  /* ===================== REGISTER ===================== */
+  // ---------- Register ----------
   router.post("/register", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
@@ -57,7 +53,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== LOGIN ===================== */
+  // ---------- Login ----------
   router.post("/login", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
@@ -82,7 +78,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== VERIFY: send ny kode ===================== */
+  // ---------- Send ny verify-kode ----------
   router.post("/request-verify", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
@@ -102,7 +98,6 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
           text: `Din nye kode: ${code} (gyldig i 15 min).`,
         });
       }
-      // Samme svar uanset om user findes, for ikke at lække
       res.json({ ok: true });
     } catch (e) {
       console.error("REQUEST-VERIFY", e);
@@ -110,28 +105,23 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== VERIFY: brug kode ===================== */
+  // ---------- Bekræft med verify-kode ----------
   router.post("/verify", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
-      // Tillad både "code" og "verificationCode" fra frontend
-      const code = norm(req.body?.code ?? req.body?.verificationCode);
+      const code = norm(req.body?.code ?? req.body?.verificationCode); // tåler begge navne
       if (!email || !code) return res.status(400).json({ error: "Missing email/code" });
 
       const user = await db.get("SELECT * FROM users WHERE email=?", email);
       if (!user) return res.status(400).json({ error: "Invalid code" });
 
-      // Hent seneste match på kode (ubrugt + ikke udløbet)
       const rec = await db.get(
         `SELECT * FROM email_verification_codes
          WHERE user_id=? AND code=? AND used=0 AND expires_at > ?
          ORDER BY id DESC LIMIT 1`,
         user.id, code, nowMs()
       );
-
-      if (!rec) {
-        return res.status(400).json({ error: "Invalid code" });
-      }
+      if (!rec) return res.status(400).json({ error: "Invalid code" });
 
       await db.run("UPDATE users SET verified=1 WHERE id=?", user.id);
       await db.run("UPDATE email_verification_codes SET used=1 WHERE id=?", rec.id);
@@ -148,7 +138,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== RESET PW: send kode ===================== */
+  // ---------- Send reset-kode ----------
   router.post("/request-reset", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
@@ -175,7 +165,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== RESET PW: brug kode ===================== */
+  // ---------- Nulstil password med kode ----------
   router.post("/reset", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
@@ -194,9 +184,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
          ORDER BY id DESC LIMIT 1`,
         user.id, code, nowMs()
       );
-      if (!rec) {
-        return res.status(400).json({ error: "Invalid or expired code" });
-      }
+      if (!rec) return res.status(400).json({ error: "Invalid or expired code" });
 
       const hash = await bcrypt.hash(newPassword, 10);
       await db.run("UPDATE users SET password_hash=? WHERE id=?", hash, user.id);
@@ -214,7 +202,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== Google Sign-In (optional) ===================== */
+  // ---------- Google (valgfri) ----------
   router.post("/google", async (req, res) => {
     try {
       if (!googleClient) return res.status(500).json({ error: "Google not configured" });
@@ -251,7 +239,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ===================== Debug (kun med DEBUG_KEY) ===================== */
+  // ---------- (Valgfri) Debug – slå til med DEBUG_KEY ENV ----------
   router.post("/_debug/peek-codes", async (req, res) => {
     try {
       const key = process.env.DEBUG_KEY || "";
