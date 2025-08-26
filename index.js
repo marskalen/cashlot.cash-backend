@@ -1,118 +1,276 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import bcrypt from "bcryptjs";
 import sqlite3 from "sqlite3";
-import dotenv from "dotenv";
+import { open } from "sqlite";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import nodemailer from "nodemailer";
+import { OAuth2Client } from "google-auth-library";
 
-dotenv.config();
+const {
+  PORT = 10000,
+  JWT_SECRET = "dev_secret_change_me",
+  FRONTEND_ORIGIN = "https://cashlot.cash",
+  SMTP_HOST,
+  SMTP_PORT,
+  SMTP_USER,
+  SMTP_PASS,
+  SMTP_FROM = "no-reply@cashlot.cash",
+  GOOGLE_CLIENT_ID
+} = process.env;
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors({
+  origin: [FRONTEND_ORIGIN, "http://localhost:5173"],
+  credentials: false
+}));
 
-// --- DB SETUP ---
-sqlite3.verbose();
-const db = new sqlite3.Database("./cashlot.db");
+// --- DB ---
+let db;
+async function initDb() {
+  db = await open({
+    filename: "./db.sqlite",
+    driver: sqlite3.Database
+  });
 
-// Opret tabel (UNIQUE email) + standardfelter
-db.run(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    username TEXT,
-    coins INTEGER DEFAULT 500,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-`);
+  await db.exec(`
+    PRAGMA journal_mode = WAL;
 
-// --- HEALTH ---
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT,
+      username TEXT,
+      provider TEXT DEFAULT 'local',
+      verified INTEGER DEFAULT 0,
+      coins INTEGER DEFAULT 500,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS email_verification_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      code TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS password_reset_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      code TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+  `);
+}
+await initDb();
+
+// --- Mailer ---
+function makeTransport() {
+  if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+    return nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: Number(SMTP_PORT || 587),
+      secure: Number(SMTP_PORT || 587) === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS }
+    });
+  }
+  // Dev fallback → logger i console
+  return {
+    sendMail: async (opts) => {
+      console.log("---- DEV EMAIL (no SMTP configured) ----");
+      console.log("TO:", opts.to);
+      console.log("SUBJECT:", opts.subject);
+      console.log("TEXT:", opts.text);
+      console.log("----------------------------------------");
+      return { messageId: "dev" };
+    }
+  };
+}
+const mailer = makeTransport();
+
+function genCode(n = 6) {
+  return Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join("");
+}
+
+function signToken(user) {
+  return jwt.sign({ uid: user.id, email: user.email }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+function authMiddleware(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing token" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// --- Routes ---
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// --- AUTH: REGISTER ---
-app.post("/auth/register", (req, res) => {
+// Register
+app.post("/auth/register", async (req, res) => {
+  const { email, password, username } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email & password required" });
+
+  const existing = await db.get("SELECT id FROM users WHERE email = ?", email.toLowerCase());
+  if (existing) return res.status(409).json({ error: "Email already in use" });
+
+  const password_hash = await bcrypt.hash(password, 10);
+  const result = await db.run(
+    "INSERT INTO users (email, password_hash, username, verified) VALUES (?, ?, ?, 0)",
+    email.toLowerCase(), password_hash, username || null
+  );
+  const userId = result.lastID;
+
+  // send email code
+  const code = genCode(6);
+  const expiresAt = Date.now() + 1000 * 60 * 15; // 15 min
+  await db.run(
+    "INSERT INTO email_verification_codes (user_id, code, expires_at) VALUES (?, ?, ?)",
+    userId, code, expiresAt
+  );
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: "Verify your Cashlot email",
+    text: `Your verification code is: ${code} (valid for 15 minutes).`
+  });
+
+  const user = await db.get("SELECT id,email,username,verified,coins,provider FROM users WHERE id = ?", userId);
+  return res.json({ user });
+});
+
+// Verify email
+app.post("/auth/verify-email", async (req, res) => {
+  const { email, code } = req.body || {};
+  if (!email || !code) return res.status(400).json({ error: "Email & code required" });
+
+  const user = await db.get("SELECT id, verified FROM users WHERE email = ?", email.toLowerCase());
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.verified) return res.json({ ok: true, alreadyVerified: true });
+
+  const row = await db.get(
+    "SELECT * FROM email_verification_codes WHERE user_id=? AND code=? AND used=0 ORDER BY id DESC LIMIT 1",
+    user.id, String(code)
+  );
+  if (!row) return res.status(400).json({ error: "Invalid code" });
+  if (Date.now() > row.expires_at) return res.status(400).json({ error: "Code expired" });
+
+  await db.run("UPDATE users SET verified=1 WHERE id=?", user.id);
+  await db.run("UPDATE email_verification_codes SET used=1 WHERE id=?", row.id);
+
+  const token = signToken({ id: user.id, email });
+  const safe = await db.get("SELECT id,email,username,verified,coins,provider FROM users WHERE id = ?", user.id);
+  return res.json({ token, user: safe });
+});
+
+// Login (requires verified)
+app.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email & password required" });
+
+  const user = await db.get("SELECT * FROM users WHERE email = ?", email.toLowerCase());
+  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+  if (user.provider !== "local") return res.status(400).json({ error: "Use Google login for this account" });
+
+  const ok = await bcrypt.compare(password, user.password_hash || "");
+  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+  if (!user.verified) return res.status(403).json({ error: "Email not verified" });
+
+  const token = signToken(user);
+  const safe = { id: user.id, email: user.email, username: user.username, verified: user.verified, coins: user.coins, provider: user.provider };
+  return res.json({ token, user: safe });
+});
+
+// Google login
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+app.post("/auth/google", async (req, res) => {
+  const { id_token } = req.body || {};
+  if (!id_token) return res.status(400).json({ error: "Missing id_token" });
   try {
-    let { email, password, username } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
-    }
+    const ticket = await googleClient.verifyIdToken({ idToken: id_token, audience: GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    const email = (payload.email || "").toLowerCase();
+    const username = payload.name || null;
 
-    email = String(email).trim().toLowerCase();
-    username = username?.trim() || email.split("@")[0];
-
-    db.get("SELECT id FROM users WHERE email = ?", [email], async (err, row) => {
-      if (err) {
-        console.error("DB error (check email):", err);
-        return res.status(500).json({ error: "Database error" });
-      }
-      if (row) {
-        return res.status(409).json({ error: "Email already in use" });
-      }
-
-      const hash = await bcrypt.hash(password, 10);
-      db.run(
-        "INSERT INTO users (email, password_hash, username, coins) VALUES (?, ?, ?, ?)",
-        [email, hash, username, 500],
-        function (insertErr) {
-          if (insertErr) {
-            if (String(insertErr?.message || "").includes("UNIQUE")) {
-              return res.status(409).json({ error: "Email already in use" });
-            }
-            console.error("DB error (insert user):", insertErr);
-            return res.status(500).json({ error: "Database error" });
-          }
-          return res.status(201).json({
-            user: { id: this.lastID, email, username, coins: 500 }
-          });
-        }
+    let user = await db.get("SELECT * FROM users WHERE email=?", email);
+    if (!user) {
+      const result = await db.run(
+        "INSERT INTO users (email, username, provider, verified, coins) VALUES (?, ?, 'google', 1, 500)",
+        email, username
       );
-    });
+      user = await db.get("SELECT * FROM users WHERE id=?", result.lastID);
+    }
+    const token = signToken(user);
+    const safe = { id: user.id, email: user.email, username: user.username, verified: user.verified, coins: user.coins, provider: user.provider };
+    return res.json({ token, user: safe });
   } catch (e) {
-    console.error("REGISTER error", e);
-    return res.status(500).json({ error: "Unexpected error" });
+    console.error(e);
+    return res.status(401).json({ error: "Invalid Google token" });
   }
 });
 
-// --- AUTH: LOGIN ---
-app.post("/auth/login", (req, res) => {
-  let { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required" });
-  }
-  email = String(email).trim().toLowerCase();
+// Forgot password: request code
+app.post("/auth/request-password-reset", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: "Email required" });
+  const user = await db.get("SELECT id FROM users WHERE email=? AND provider='local'", email.toLowerCase());
+  if (!user) return res.json({ ok: true }); // silent
 
-  db.get("SELECT * FROM users WHERE email = ?", [email], async (err, user) => {
-    if (err) {
-      console.error("DB error (login):", err);
-      return res.status(500).json({ error: "Database error" });
-    }
-    if (!user) return res.status(401).json({ error: "Invalid credentials" });
-
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
-
-    const { password_hash, ...publicUser } = user;
-    return res.json({ user: publicUser });
+  const code = genCode(6);
+  const expiresAt = Date.now() + 1000 * 60 * 15;
+  await db.run(
+    "INSERT INTO password_reset_codes (user_id, code, expires_at) VALUES (?, ?, ?)",
+    user.id, code, expiresAt
+  );
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: "Cashlot password reset",
+    text: `Your password reset code is: ${code} (valid for 15 minutes).`
   });
+  return res.json({ ok: true });
 });
 
-// --- ME (valgfrit “public” uden token til demo) ---
-app.get("/me/:email", (req, res) => {
-  const email = String(req.params.email || "").trim().toLowerCase();
-  if (!email) return res.status(400).json({ error: "Missing email" });
+// Reset password with code
+app.post("/auth/reset-password", async (req, res) => {
+  const { email, code, new_password } = req.body || {};
+  if (!email || !code || !new_password) return res.status(400).json({ error: "Missing fields" });
+  const user = await db.get("SELECT * FROM users WHERE email=?", email.toLowerCase());
+  if (!user || user.provider !== "local") return res.status(400).json({ error: "Invalid account" });
 
-  db.get("SELECT id, email, username, coins, created_at FROM users WHERE email = ?", [email], (err, row) => {
-    if (err) {
-      console.error("DB error (/me):", err);
-      return res.status(500).json({ error: "Database error" });
-    }
-    if (!row) return res.status(404).json({ error: "Not found" });
-    return res.json({ user: row });
-  });
+  const row = await db.get(
+    "SELECT * FROM password_reset_codes WHERE user_id=? AND code=? AND used=0 ORDER BY id DESC LIMIT 1",
+    user.id, String(code)
+  );
+  if (!row) return res.status(400).json({ error: "Invalid code" });
+  if (Date.now() > row.expires_at) return res.status(400).json({ error: "Code expired" });
+
+  const hash = await bcrypt.hash(new_password, 10);
+  await db.run("UPDATE users SET password_hash=? WHERE id=?", hash, user.id);
+  await db.run("UPDATE password_reset_codes SET used=1 WHERE id=?", row.id);
+  return res.json({ ok: true });
 });
 
-// --- START SERVER ---
-const PORT = process.env.PORT || 10000;
+// Example protected route
+app.get("/me", authMiddleware, async (req, res) => {
+  const u = await db.get("SELECT id,email,username,verified,coins,provider FROM users WHERE id=?", req.user.uid);
+  return res.json({ user: u });
+});
+
 app.listen(PORT, () => {
-  console.log("Server listening on", PORT);
+  console.log(`Cashlot backend on :${PORT}`);
 });
