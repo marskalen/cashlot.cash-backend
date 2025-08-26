@@ -23,6 +23,24 @@ const {
 } = process.env;
 
 const app = express();
+// --- CORS & JSON body parser ---
+const ALLOW_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+
+app.use(
+  cors({
+    origin: ALLOW_ORIGIN, // én streng (ikke array)
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  })
+);
+
+// svar på preflight for alle ruter
+app.options("*", cors());
+
+// JSON parsing SKAL komme efter CORS
+app.use(express.json());
+
 
 /* ---------------- CORS (robust til prod) ---------------- */
 const ALLOW_ORIGIN = FRONTEND_ORIGIN || "http://localhost:5173";
