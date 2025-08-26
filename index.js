@@ -21,13 +21,19 @@ const {
 } = process.env;
 
 const app = express();
-app.use(express.json());
+
+// --- CORS & body parser (CORS først, inkl. preflight) ----------------------
+// <<< strammere CORS + preflight + tillad Authorization header
 app.use(
   cors({
-    origin: [FRONTEND_ORIGIN, "http://localhost:5173"],
-    credentials: false,
+    origin: FRONTEND_ORIGIN, // prod origin
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false, // sæt true hvis du bruger cookies/session
   })
 );
+app.options("*", cors());
+app.use(express.json());
 
 // ---------------- DB ----------------
 let db;
@@ -142,6 +148,23 @@ async function findUserByUid(uid) {
 
 // --------------- Routes ---------------
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// <<< Midlertidigt SMTP test-endpoint (slet når du er færdig)
+app.post("/debug/send-email", async (req, res) => {
+  try {
+    const to = (req.body && req.body.to) || "businessmarskalen@gmail.com";
+    await mailer.sendMail({
+      from: SMTP_FROM,
+      to,
+      subject: "Cashlot test",
+      text: "If you see this, SMTP works! 🎉",
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("debug email err", e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 // Register
 app.post("/auth/register", async (req, res) => {
