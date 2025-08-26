@@ -7,9 +7,7 @@ import { open } from "sqlite";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
-
-// ⬇️ VIGTIG: test-router (default export fra ./routes/auth.js)
-import authRouter from "./routes/auth.js";
+import authRouter from "./routes/auth.js"; // ⬅️ VIGTIGT
 
 const {
   PORT = 10000,
@@ -27,14 +25,12 @@ const {
 const app = express();
 
 /* ---------- CORS ---------- */
-app.use(
-  cors({
-    origin: FRONTEND_ORIGIN,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: FRONTEND_ORIGIN,
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+  credentials: true,
+}));
 app.options("*", cors());
 
 /* ---------- JSON ---------- */
@@ -63,22 +59,6 @@ function makeTransport() {
   };
 }
 const mailer = makeTransport();
-
-app.post("/debug/send-email", async (req, res) => {
-  try {
-    const { to = "businessmarskalen@gmail.com" } = req.body || {};
-    await mailer.sendMail({
-      from: SMTP_FROM,
-      to,
-      subject: "Cashlot test",
-      text: "If you see this, SMTP works! 🎉",
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("debug email err", e);
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
 
 /* ---------- DB ---------- */
 let db;
@@ -150,12 +130,11 @@ async function findUserByUid(uid) {
   return await db.get("SELECT * FROM users WHERE email=?", String(uid).toLowerCase());
 }
 
-/* ---------- AUTH ROUTES (TEST) ---------- */
-/*  ⬇️ Mount test-routeren. Når den svarer 200 OK, kan du bytte routes/auth.js
-    til den fulde version – men behold denne mount. */
+/* ---------- AUTH ROUTES (MOUNT) ---------- */
 app.use("/auth", authRouter);
+console.log("[BOOT] Mounted /auth router");
 
-/* ---------- Debug: se registrerede ruter ---------- */
+/* ---------- Debug: list routes ---------- */
 app.get("/__routes", (req, res) => {
   const stack = (app._router?.stack || []).map((l) => {
     if (l.route) return { path: l.route.path, methods: l.route.methods };
@@ -167,7 +146,6 @@ app.get("/__routes", (req, res) => {
 
 /* ---------- BitLabs callback ---------- */
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
-
 app.get("/bitlabs/callback", async (req, res) => {
   try {
     const { uid, tx, amount, key } = req.query;
@@ -210,7 +188,7 @@ app.get("/me", authMiddleware, async (req, res) => {
 /* ---------- 404 fallback ---------- */
 app.use((req, res) => res.status(404).json({ error: "Not found", path: req.path }));
 
-/* ---------- Start server ---------- */
+/* ---------- Start ---------- */
 app.listen(PORT, () => {
   console.log(`Cashlot backend on :${PORT}`);
 });
