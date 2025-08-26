@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
+import createAuthRouter from "./routes/auth.js";
 
 const {
   PORT = 10000,
@@ -24,25 +25,26 @@ const {
 
 const app = express();
 
-/* ---------- CORS skal stå først ---------- */
+/* ---------- CORS ---------- */
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN, // ENV → https://cashlot.cash
+    origin: FRONTEND_ORIGIN,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   })
 );
-app.options("*", cors()); // preflight for alle ruter
+app.options("*", cors());
 
-/* ---------- JSON parser ---------- */
+/* ---------- JSON ---------- */
 app.use(express.json());
 
-/* ---------- Health + debug email ---------- */
+/* ---------- Health ---------- */
 app.get("/health", (_req, res) =>
   res.json({ ok: true, env: process.env.NODE_ENV || "production" })
 );
 
+/* ---------- Mailer ---------- */
 function makeTransport() {
   if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
     return nodemailer.createTransport({
@@ -77,7 +79,7 @@ app.post("/debug/send-email", async (req, res) => {
   }
 });
 
-/* ---------- DB init ---------- */
+/* ---------- DB ---------- */
 let db;
 async function initDb() {
   db = await open({ filename: "./db.sqlite", driver: sqlite3.Database });
@@ -126,9 +128,6 @@ async function initDb() {
 await initDb();
 
 /* ---------- Helpers ---------- */
-function genCode(n = 6) {
-  return Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join("");
-}
 function signToken(user) {
   return jwt.sign({ uid: user.id, email: user.email }, JWT_SECRET, { expiresIn: "30d" });
 }
@@ -150,8 +149,18 @@ async function findUserByUid(uid) {
   return await db.get("SELECT * FROM users WHERE email=?", String(uid).toLowerCase());
 }
 
-/* ---------- Routes: Auth (register, verify, login, google, reset pw) ---------- */
-// … (indsæt dine auth-ruter som du allerede har – uændret, bare behold rækkefølgen med CORS/JSON over dem)
+/* ---------- AUTH ROUTES (MOUNT) ---------- */
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+app.use(
+  "/auth",
+  createAuthRouter({
+    db,
+    mailer,
+    smtpFrom: SMTP_FROM,
+    signToken,
+    googleClient,
+  })
+);
 
 /* ---------- BitLabs callback ---------- */
 app.get("/bitlabs/callback", async (req, res) => {
@@ -192,6 +201,9 @@ app.get("/me", authMiddleware, async (req, res) => {
   );
   return res.json({ user: u });
 });
+
+/* ---------- 404 fallback ---------- */
+app.use((req, res) => res.status(404).json({ error: "Not found", path: req.path }));
 
 /* ---------- Start server ---------- */
 app.listen(PORT, () => {
