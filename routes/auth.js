@@ -2,20 +2,25 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 
-/* Utils */
-const normEmail = (e) => String(e || "").trim().toLowerCase();
+/* Helpers */
+const norm = (v) => String(v ?? "").trim();
+const normEmail = (e) => norm(e).toLowerCase();
 const genCode = (n = 6) =>
   Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join("");
+
+// Small guard: ensure integers in ms
+const nowMs = () => Date.now();
+const inMinutes = (m) => nowMs() + m * 60 * 1000;
 
 export default function createAuthRouter({ db, mailer, smtpFrom, signToken, googleClient }) {
   const router = Router();
 
-  /* ---------- Register ---------- */
+  /* ===================== REGISTER ===================== */
   router.post("/register", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
-      const password = String(req.body?.password || "");
-      const username = String(req.body?.username || email.split("@")[0]);
+      const password = norm(req.body?.password);
+      const username = norm(req.body?.username || email.split("@")[0]);
       if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
 
       const exists = await db.get("SELECT id FROM users WHERE email=?", email);
@@ -28,11 +33,10 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
       );
       const userId = r.lastID;
 
-      // send verify code
       const code = genCode(6);
       await db.run(
         "INSERT INTO email_verification_codes (user_id, code, expires_at, used) VALUES (?, ?, ?, 0)",
-        userId, code, Date.now() + 15 * 60 * 1000
+        userId, code, inMinutes(15)
       );
       await mailer.sendMail({
         from: smtpFrom,
@@ -41,7 +45,10 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
         text: `Din kode: ${code} (gyldig i 15 min).`,
       });
 
-      const user = await db.get("SELECT id,email,username,verified,coins,provider FROM users WHERE id=?", userId);
+      const user = await db.get(
+        "SELECT id,email,username,verified,coins,provider FROM users WHERE id=?",
+        userId
+      );
       const token = signToken(user);
       res.json({ token, user });
     } catch (e) {
@@ -50,11 +57,11 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ---------- Login ---------- */
+  /* ===================== LOGIN ===================== */
   router.post("/login", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
-      const password = String(req.body?.password || "");
+      const password = norm(req.body?.password);
       if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
 
       const user = await db.get("SELECT * FROM users WHERE email=?", email);
@@ -75,26 +82,27 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ---------- Email verify: send ny kode ---------- */
+  /* ===================== VERIFY: send ny kode ===================== */
   router.post("/request-verify", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
       if (!email) return res.status(400).json({ error: "Missing email" });
 
       const user = await db.get("SELECT * FROM users WHERE email=?", email);
-      if (!user || user.verified) return res.json({ ok: true });
-
-      const code = genCode(6);
-      await db.run(
-        "INSERT INTO email_verification_codes (user_id, code, expires_at, used) VALUES (?, ?, ?, 0)",
-        user.id, code, Date.now() + 15 * 60 * 1000
-      );
-      await mailer.sendMail({
-        from: smtpFrom,
-        to: email,
-        subject: "Cashlot – bekræft din email",
-        text: `Din kode: ${code} (gyldig i 15 min).`,
-      });
+      if (user && !user.verified) {
+        const code = genCode(6);
+        await db.run(
+          "INSERT INTO email_verification_codes (user_id, code, expires_at, used) VALUES (?, ?, ?, 0)",
+          user.id, code, inMinutes(15)
+        );
+        await mailer.sendMail({
+          from: smtpFrom,
+          to: email,
+          subject: "Cashlot – bekræft din email (ny kode)",
+          text: `Din nye kode: ${code} (gyldig i 15 min).`,
+        });
+      }
+      // Samme svar uanset om user findes, for ikke at lække
       res.json({ ok: true });
     } catch (e) {
       console.error("REQUEST-VERIFY", e);
@@ -102,22 +110,27 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ---------- Email verify: brug kode ---------- */
+  /* ===================== VERIFY: brug kode ===================== */
   router.post("/verify", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
-      const code = String(req.body?.code || "");
+      // Tillad både "code" og "verificationCode" fra frontend
+      const code = norm(req.body?.code ?? req.body?.verificationCode);
       if (!email || !code) return res.status(400).json({ error: "Missing email/code" });
 
       const user = await db.get("SELECT * FROM users WHERE email=?", email);
       if (!user) return res.status(400).json({ error: "Invalid code" });
 
+      // Hent seneste match på kode (ubrugt + ikke udløbet)
       const rec = await db.get(
-        "SELECT * FROM email_verification_codes WHERE user_id=? AND code=? ORDER BY id DESC LIMIT 1",
-        user.id, code
+        `SELECT * FROM email_verification_codes
+         WHERE user_id=? AND code=? AND used=0 AND expires_at > ?
+         ORDER BY id DESC LIMIT 1`,
+        user.id, code, nowMs()
       );
-      if (!rec || rec.used || Date.now() > Number(rec.expires_at)) {
-        return res.status(400).json({ error: "Invalid or expired code" });
+
+      if (!rec) {
+        return res.status(400).json({ error: "Invalid code" });
       }
 
       await db.run("UPDATE users SET verified=1 WHERE id=?", user.id);
@@ -135,7 +148,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ---------- Glemt password: send kode ---------- */
+  /* ===================== RESET PW: send kode ===================== */
   router.post("/request-reset", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
@@ -146,7 +159,7 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
         const code = genCode(6);
         await db.run(
           "INSERT INTO password_reset_codes (user_id, code, expires_at, used) VALUES (?, ?, ?, 0)",
-          user.id, code, Date.now() + 15 * 60 * 1000
+          user.id, code, inMinutes(15)
         );
         await mailer.sendMail({
           from: smtpFrom,
@@ -155,7 +168,6 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
           text: `Din nulstillingskode: ${code} (gyldig i 15 min).`,
         });
       }
-      // Samme svar uanset om email findes, for ikke at lække
       res.json({ ok: true });
     } catch (e) {
       console.error("REQUEST-RESET", e);
@@ -163,12 +175,12 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ---------- Glemt password: brug kode + nyt password ---------- */
+  /* ===================== RESET PW: brug kode ===================== */
   router.post("/reset", async (req, res) => {
     try {
       const email = normEmail(req.body?.email);
-      const code = String(req.body?.code || "");
-      const newPassword = String(req.body?.newPassword || "");
+      const code = norm(req.body?.code);
+      const newPassword = norm(req.body?.newPassword);
       if (!email || !code || !newPassword) {
         return res.status(400).json({ error: "Missing email/code/newPassword" });
       }
@@ -177,10 +189,12 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
       if (!user) return res.status(400).json({ error: "Invalid or expired code" });
 
       const rec = await db.get(
-        "SELECT * FROM password_reset_codes WHERE user_id=? AND code=? ORDER BY id DESC LIMIT 1",
-        user.id, code
+        `SELECT * FROM password_reset_codes
+         WHERE user_id=? AND code=? AND used=0 AND expires_at > ?
+         ORDER BY id DESC LIMIT 1`,
+        user.id, code, nowMs()
       );
-      if (!rec || rec.used || Date.now() > Number(rec.expires_at)) {
+      if (!rec) {
         return res.status(400).json({ error: "Invalid or expired code" });
       }
 
@@ -200,21 +214,21 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     }
   });
 
-  /* ---------- Google Sign-In (valgfri) ---------- */
+  /* ===================== Google Sign-In (optional) ===================== */
   router.post("/google", async (req, res) => {
     try {
       if (!googleClient) return res.status(500).json({ error: "Google not configured" });
-      const idToken = String(req.body?.idToken || "");
+      const idToken = norm(req.body?.idToken);
       if (!idToken) return res.status(400).json({ error: "Missing idToken" });
 
       const ticket = await googleClient.verifyIdToken({ idToken, audience: undefined });
       const payload = ticket.getPayload();
-      const email = normEmail(payload?.email || "");
+      const email = normEmail(payload?.email);
       if (!email) return res.status(400).json({ error: "No email in token" });
 
       let user = await db.get("SELECT * FROM users WHERE email=?", email);
       if (!user) {
-        const username = (payload?.name || email.split("@")[0]).slice(0, 32);
+        const username = norm(payload?.name || email.split("@")[0]).slice(0, 32);
         const r = await db.run(
           "INSERT INTO users (email, username, provider, verified) VALUES (?, ?, 'google', 1)",
           email, username
@@ -234,6 +248,34 @@ export default function createAuthRouter({ db, mailer, smtpFrom, signToken, goog
     } catch (e) {
       console.error("GOOGLE", e);
       res.status(401).json({ error: "Invalid Google token" });
+    }
+  });
+
+  /* ===================== Debug (kun med DEBUG_KEY) ===================== */
+  router.post("/_debug/peek-codes", async (req, res) => {
+    try {
+      const key = process.env.DEBUG_KEY || "";
+      if (!key) return res.status(404).json({ error: "Not found" });
+      if (norm(req.body?.key) !== key) return res.status(401).json({ error: "Unauthorized" });
+
+      const email = normEmail(req.body?.email);
+      if (!email) return res.status(400).json({ error: "Missing email" });
+
+      const user = await db.get("SELECT * FROM users WHERE email=?", email);
+      if (!user) return res.json({ email, verifyCodes: [], resetCodes: [] });
+
+      const verifyCodes = await db.all(
+        "SELECT id, code, used, expires_at, created_at FROM email_verification_codes WHERE user_id=? ORDER BY id DESC LIMIT 5",
+        user.id
+      );
+      const resetCodes = await db.all(
+        "SELECT id, code, used, expires_at, created_at FROM password_reset_codes WHERE user_id=? ORDER BY id DESC LIMIT 5",
+        user.id
+      );
+      res.json({ email, verifyCodes, resetCodes, now: nowMs() });
+    } catch (e) {
+      console.error("_DEBUG/PEEK-CODES", e);
+      res.status(500).json({ error: "Server error" });
     }
   });
 
