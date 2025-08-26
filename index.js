@@ -7,7 +7,7 @@ import { open } from "sqlite";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
-import authRouter from "./routes/auth.js"; // ⬅️ VIGTIGT
+import createAuthRouter from "./routes/auth.js";
 
 const {
   PORT = 10000,
@@ -130,13 +130,15 @@ async function findUserByUid(uid) {
   return await db.get("SELECT * FROM users WHERE email=?", String(uid).toLowerCase());
 }
 
-/* ---------- AUTH ROUTES (MOUNT) ---------- */
-app.use("/auth", authRouter);
-console.log("[BOOT] Mounted /auth router");
+/* ---------- AUTH routes (mount) ---------- */
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+app.use("/auth", createAuthRouter({
+  db, mailer, smtpFrom: SMTP_FROM, signToken, googleClient
+}));
 
-/* ---------- Debug: list routes ---------- */
+/* (valgfrit) Debug: list routes */
 app.get("/__routes", (req, res) => {
-  const stack = (app._router?.stack || []).map((l) => {
+  const stack = (app._router?.stack || []).map(l => {
     if (l.route) return { path: l.route.path, methods: l.route.methods };
     if (l.name === "router" && l.regexp) return { router: true, mountedAt: l.regexp.toString() };
     return null;
@@ -145,7 +147,6 @@ app.get("/__routes", (req, res) => {
 });
 
 /* ---------- BitLabs callback ---------- */
-const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 app.get("/bitlabs/callback", async (req, res) => {
   try {
     const { uid, tx, amount, key } = req.query;
