@@ -1,3 +1,4 @@
+// mailer.js
 import nodemailer from "nodemailer";
 
 const {
@@ -6,26 +7,62 @@ const {
   SMTP_SECURE,
   SMTP_USER,
   SMTP_PASS,
-  FROM_EMAIL
+  FROM_EMAIL,
 } = process.env;
+
+// Hjælp: lav bool korrekt fra env
+const secureBool = String(SMTP_SECURE).toLowerCase() === "true";
+const portNum = Number(SMTP_PORT) || 587;
+
+// ADVARSEL: 587 bruges normalt med secure=false (STARTTLS)
+if (portNum === 587 && secureBool) {
+  console.warn("[SMTP] Warning: PORT=587 men SECURE=true. Overvej at sætte SMTP_SECURE=false (STARTTLS).");
+}
 
 export const transporter = nodemailer.createTransport({
   host: SMTP_HOST,
-  port: Number(SMTP_PORT) || 587,
-  secure: String(SMTP_SECURE) === "true",
-  auth: { user: SMTP_USER, pass: SMTP_PASS }
+  port: portNum,
+  secure: secureBool, // true for 465 (SSL), false for 587 (STARTTLS)
+  auth: { user: SMTP_USER, pass: SMTP_PASS },
 });
 
+// 🔎 Verificér SMTP-forbindelse ved opstart
+transporter
+  .verify()
+  .then(() => {
+    console.log("[SMTP] OK: connection ready");
+  })
+  .catch((err) => {
+    console.error("[SMTP] FAILED:", err?.message || err);
+  });
+
+// Normaliser FROM (format: "Navn <email@domæne>")
+function normalizedFrom() {
+  const fallback = SMTP_USER || "no-reply@localhost";
+  // Hvis FROM_EMAIL ikke har vinkelparanteser, forsøg at pakke den pænt
+  if (!FROM_EMAIL) return fallback;
+  if (FROM_EMAIL.includes("<") && FROM_EMAIL.includes(">")) return FROM_EMAIL;
+  // Fx "Cashlot no-reply@cashlot.cash" -> "Cashlot <no-reply@cashlot.cash>"
+  const parts = FROM_EMAIL.trim().split(/\s+/);
+  const maybeEmail = parts.pop();
+  const name = parts.join(" ") || "Cashlot";
+  return `${name} <${maybeEmail}>`;
+}
+
 export async function sendMail({ to, subject, html, text }) {
-  return transporter.sendMail({
-    from: FROM_EMAIL || SMTP_USER,
+  const info = await transporter.sendMail({
+    from: normalizedFrom(),
     to,
     subject,
     text,
-    html
+    html,
+    // replyTo: SMTP_USER, // valgfrit
   });
+  console.log("[SMTP] Message queued:", info.messageId, "to:", to);
+  return info;
 }
 
+// simple templates
 export function tplVerification({ link }) {
   return {
     subject: "Verify your Cashlot account",
@@ -38,7 +75,7 @@ export function tplVerification({ link }) {
         <p><a href="${link}">${link}</a></p>
       </div>
     `,
-    text: `Verify your email: ${link}`
+    text: `Verify your email: ${link}`,
   };
 }
 
@@ -53,6 +90,6 @@ export function tplReset({ link }) {
         <p>Or open this URL: <a href="${link}">${link}</a></p>
       </div>
     `,
-    text: `Reset your password: ${link}`
+    text: `Reset your password: ${link}`,
   };
 }
